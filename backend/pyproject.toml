@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "rag-backend"
+version = "0.1.0"
+description = "Document_RAG backend"
+authors = ["sanket singh <sanket.raj01@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "app" }]  # optional if you're installing your own code
+# If not installing as package, you can skip `packages`
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+fastapi = ">=0.115.12,<0.116.0"
+uvicorn = { extras = ["standard"], version = ">=0.34.2,<0.35.0" }
+redis = "^5.0"
+celery = { extras = ["redis"], version = "^5.3" }
+pydantic = "^2.11.4"
+python-dotenv = "^1.1.0"
+pydantic-settings = "^2.9.1"
+python-multipart = "^0.0.20"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

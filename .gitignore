@@ -1,3 +1,3 @@
 ".venv/\n__pycache__/" 
-"./rag-app/poetry.lock"
-"./rag-app/pyproject.toml"
+"./rag-app/backend/poetry.lock"
+"./rag-app/backend/pyproject.toml"

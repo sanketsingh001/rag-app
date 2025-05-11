@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  api:
+    build: ./backend
+    container_name: rag_api
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on: [redis]
+
+  worker:
+    build: ./backend          # reuse same image
+    container_name: rag_worker
+    command: celery -A worker.ingest:celery_app worker -l info
+    env_file: .env
+    depends_on: [redis]
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    ports: ["6379:6379"]
+
+# volumes: later we’ll add qdrant_data etc.
