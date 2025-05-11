@@ -20,4 +20,15 @@ services:
     container_name: rag_redis
     ports: ["6379:6379"]
 
+  
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rag_qdarnt
+    ports: ["6333:6333"]
+    volumes:
+      - qdrant_data:/qdarnt/storage
+  
+volumes:
+  qdrant_data:
 # volumes: later we’ll add qdrant_data etc.

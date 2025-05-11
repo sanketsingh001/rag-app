@@ -6,7 +6,7 @@ from worker.ingest import ingest_document   # Celery task
 
 router = APIRouter()
 settings = get_settings()
-redis = Redis.from_url(settings.redis_url, decode_responses=True)
+redis = Redis.from_url(settings.redis_url, decode_responses=False)
 
 
 @router.post("/")        # <-- will map to /upload/  (note the trailing slash)

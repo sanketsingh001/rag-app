@@ -1,18 +1,144 @@
+"""
+worker/ingest.py
+Celery worker that
+1. pulls the uploaded file bytes from Redis
+2. extracts / chunks text
+3. generates Gemini embeddings               (vector length = 768)
+4. upserts points into the `document` collection in Qdrant
+"""
+
+import os
+from io import BytesIO
+from uuid import UUID
+import magic
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ❶  Library imports
+# ──────────────────────────────────────────────────────────────────────────────
 from celery import Celery
+from redis import Redis
+import google.generativeai as genai
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant
+from unstructured.partition.auto import partition
+from unstructured.partition.text import partition_text
+
 from app.core.config import get_settings
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  ❷  Global objects (only once per worker process)
+# ──────────────────────────────────────────────────────────────────────────────
 settings = get_settings()
 
+# -- Redis --------------------------------------------------------------------
+redis = Redis.from_url(settings.redis_url, decode_responses=False)   # RAW bytes!
+
+# -- Google AI ----------------------------------------------------------------
+genai.configure(api_key=settings.gemini_api_key or os.getenv("GOOGLE_API_KEY"))
+EMBED_MODEL = "models/embedding-001"          # public model, vector size 768
+VECTOR_DIM  = 768
+
+# -- Qdrant -------------------------------------------------------------------
+qdrant_cli = QdrantClient(url=settings.qdrant_url)
+COLLECTION = "document"
+
+if COLLECTION not in [c.name for c in qdrant_cli.get_collections().collections]:
+    qdrant_cli.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=qdrant.VectorParams(size=VECTOR_DIM,
+                                           distance=qdrant.Distance.COSINE),
+    )
+
+# -- Celery -------------------------------------------------------------------
 celery_app = Celery(
     "worker",
-    broker=settings.redis_url,   # redis://redis:6379/0
+    broker=settings.redis_url,
     backend=settings.redis_url,
     task_serializer="json",
     result_serializer="json",
 )
 
-@celery_app.task(name="ingest_document")   # <— THIS decorator is mandatory
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ❸  Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def gemini_embed(texts: list[str]) -> list[list[float]]:
+    """Call Gemini embed endpoint; returns list[list[float]] (len == 768)."""
+    vectors: list[list[float]] = []
+    for txt in texts:
+        res = genai.embed_content(
+            model=EMBED_MODEL,
+            content=txt,
+            task_type="SEMANTIC_SIMILARITY",
+        )
+        vectors.append(res["embedding"])
+    return vectors
+
+
+def safe_payload(file_id: UUID | str, idx: int, chunk: str, filename: str):
+    """Return a pure-JSON payload (no UUID, no None, no bytes)."""
+    return {
+        "file_id": str(file_id),
+        "chunk_idx": idx,
+        "text": chunk,
+        "filename": filename,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ❹  Celery task
+# ──────────────────────────────────────────────────────────────────────────────
+@celery_app.task(name="ingest_document")
 def ingest_document(file_id: str, filename: str) -> str:
-    # heavy-lifting placeholder
-    print("Ingesting", filename)
-    return "ok"
+    """
+    • Pull file bytes from redis
+    • Partition -> full_text
+    • Chunk ~1200 chars   (≈ ~350 tokens)
+    • Embed & upsert
+    """
+    # ------------------------------------------------------------------ fetch
+    raw: bytes | None = redis.get(f"file:{file_id}")
+    if raw is None:
+        return "Redis key expired (upload again)."
+
+    # ---------------------------------------------------------------- extract
+    buffer = BytesIO(raw)
+    try:
+        mime = magic.from_buffer(buffer[:2048], mime=True)  # needs libmagic1
+        if mime == "text/plain" or filename.lower().endswith(".txt"):
+        # Simple .txt → split into paragraphs
+            elements = partition_text(text=buffer.decode("utf-8", errors="ignore"))
+        else:
+        # PDF, DOCX, MD, PPTX, …
+         elements = partition(file=buffer)
+    # -------------------------------------
+    except Exception as exc:
+        return f"Partition-error: {exc}"
+
+    full_text = "\n".join(str(el) for el in elements)
+    if not full_text.strip():
+        return "No textual content found."
+
+    # ---------------------------------------------------------------- chunk
+    CHUNK_SIZE = 1_200
+    chunks = [full_text[i : i + CHUNK_SIZE] for i in range(0, len(full_text), CHUNK_SIZE)]
+
+    # ---------------------------------------------------------------- embed
+    vectors = gemini_embed(chunks)
+    if any(len(v) != VECTOR_DIM for v in vectors):
+        raise ValueError("Vector dimension mismatch!")
+
+    # ---------------------------------------------------------------- upsert
+    points: list[qdrant.PointStruct] = []
+    for idx, (vec, chunk) in enumerate(zip(vectors, chunks)):
+        points.append(
+            qdrant.PointStruct(
+                id=f"{file_id}-{idx}",
+                vector=vec,                # ← singular “vector”
+                payload=safe_payload(file_id, idx, chunk, filename),
+            )
+        )
+
+    # Qdrant returns OperationResult; we ignore value
+    qdrant_cli.upsert(collection_name=COLLECTION, points=points, wait=True)
+    return f"Inserted {len(points)} chunks for file {filename}"
