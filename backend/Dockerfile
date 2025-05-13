@@ -1,18 +1,16 @@
 FROM python:3.11-slim AS builder
 WORKDIR /app
 
-# install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libmagic1 poppler-utils tesseract-ocr \
- && rm -rf /var/lib/apt/lists/*
+# only install build-time dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
-# install poetry and only lock dependencies
+# install poetry and lock dependencies
 COPY pyproject.toml poetry.lock ./
 RUN pip install --no-cache-dir poetry \
  && poetry config virtualenvs.create false \
  && poetry install --only main --no-ansi --no-interaction --no-root
 
-# copy source code after installing dependencies
+
 COPY . .
 
 # runtime
@@ -20,8 +18,12 @@ FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 file poppler-utils tesseract-ocr \
+ && rm -rf /var/lib/apt/lists/*
+
+
+COPY --from=builder /usr/local /usr/local
 COPY app app
 COPY worker worker
 

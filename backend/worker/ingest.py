@@ -1,53 +1,69 @@
 """
 worker/ingest.py
+────────────────
 Celery worker that
+
 1. pulls the uploaded file bytes from Redis
 2. extracts / chunks text
-3. generates Gemini embeddings               (vector length = 768)
+3. generates Gemini embeddings (vector length = 768)
 4. upserts points into the `document` collection in Qdrant
 """
+from __future__ import annotations
 
 import os
 from io import BytesIO
 from uuid import UUID
-import magic
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  ❶  Library imports
-# ──────────────────────────────────────────────────────────────────────────────
-from celery import Celery
-from redis import Redis
 import google.generativeai as genai
+import magic
+from celery import Celery
+from celery.signals import worker_process_init
+from redis import Redis
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant
+from qdrant_client.http.exceptions import UnexpectedResponse
 from unstructured.partition.auto import partition
 from unstructured.partition.text import partition_text
 
 from app.core.config import get_settings
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ❷  Global objects (only once per worker process)
+# ❶  Global configuration (only once per worker process)
 # ──────────────────────────────────────────────────────────────────────────────
 settings = get_settings()
 
 # -- Redis --------------------------------------------------------------------
-redis = Redis.from_url(settings.redis_url, decode_responses=False)   # RAW bytes!
+redis = Redis.from_url(settings.redis_url, decode_responses=False)  # RAW bytes!
 
 # -- Google AI ----------------------------------------------------------------
 genai.configure(api_key=settings.gemini_api_key or os.getenv("GOOGLE_API_KEY"))
-EMBED_MODEL = "models/embedding-001"          # public model, vector size 768
-VECTOR_DIM  = 768
+EMBED_MODEL = "models/embedding-001"  # public model, vector size 768
+VECTOR_DIM = 768
 
 # -- Qdrant -------------------------------------------------------------------
 qdrant_cli = QdrantClient(url=settings.qdrant_url)
 COLLECTION = "document"
 
-if COLLECTION not in [c.name for c in qdrant_cli.get_collections().collections]:
-    qdrant_cli.create_collection(
-        collection_name=COLLECTION,
-        vectors_config=qdrant.VectorParams(size=VECTOR_DIM,
-                                           distance=qdrant.Distance.COSINE),
-    )
+
+@worker_process_init.connect
+def _ensure_qdrant_collection(**_):
+    """
+    Runs once per worker *process* before any task executes.
+    Creates the collection if it isn't there – if another process beat us to it
+    we silently swallow Qdrant's 409 Conflict.
+    """
+    try:
+        if COLLECTION not in {c.name for c in qdrant_cli.get_collections().collections}:
+            qdrant_cli.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=qdrant.VectorParams(
+                    size=VECTOR_DIM, distance=qdrant.Distance.COSINE
+                ),
+            )
+    except UnexpectedResponse as exc:
+        if "already exists" not in str(exc):
+            raise
+
 
 # -- Celery -------------------------------------------------------------------
 celery_app = Celery(
@@ -58,9 +74,8 @@ celery_app = Celery(
     result_serializer="json",
 )
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-#  ❸  Helpers
+# ❷  Helper functions
 # ──────────────────────────────────────────────────────────────────────────────
 def gemini_embed(texts: list[str]) -> list[list[float]]:
     """Call Gemini embed endpoint; returns list[list[float]] (len == 768)."""
@@ -75,8 +90,8 @@ def gemini_embed(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def safe_payload(file_id: UUID | str, idx: int, chunk: str, filename: str):
-    """Return a pure-JSON payload (no UUID, no None, no bytes)."""
+def safe_payload(file_id: UUID | str, idx: int, chunk: str, filename: str) -> dict:
+    """Return a pure-JSON payload – no UUID objects, no None, no bytes."""
     return {
         "file_id": str(file_id),
         "chunk_idx": idx,
@@ -86,32 +101,35 @@ def safe_payload(file_id: UUID | str, idx: int, chunk: str, filename: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ❹  Celery task
+# ❸  Celery task
 # ──────────────────────────────────────────────────────────────────────────────
 @celery_app.task(name="ingest_document")
 def ingest_document(file_id: str, filename: str) -> str:
     """
-    • Pull file bytes from redis
-    • Partition -> full_text
+    • Pull file bytes from Redis
+    • Partition → full_text
     • Chunk ~1200 chars   (≈ ~350 tokens)
     • Embed & upsert
     """
-    # ------------------------------------------------------------------ fetch
+    # ---------------------------------------------------------------- fetch
     raw: bytes | None = redis.get(f"file:{file_id}")
     if raw is None:
         return "Redis key expired (upload again)."
 
     # ---------------------------------------------------------------- extract
-    buffer = BytesIO(raw)
+    # Get first 2 KiB *directly from bytes* for libmagic
+    header = raw[:2048]
     try:
-        mime = magic.from_buffer(buffer[:2048], mime=True)  # needs libmagic1
+        mime = magic.from_buffer(header, mime=True)  # needs libmagic1
+
         if mime == "text/plain" or filename.lower().endswith(".txt"):
-        # Simple .txt → split into paragraphs
-            elements = partition_text(text=buffer.decode("utf-8", errors="ignore"))
+            # Simple .txt → split into paragraphs
+            elements = partition_text(text=raw.decode("utf-8", errors="ignore"))
         else:
-        # PDF, DOCX, MD, PPTX, …
-         elements = partition(file=buffer)
-    # -------------------------------------
+            # PDF, DOCX, MD, PPTX, …
+            buffer = BytesIO(raw)
+            buffer.seek(0)  # make sure the stream is at the beginning
+            elements = partition(file=buffer)
     except Exception as exc:
         return f"Partition-error: {exc}"
 
@@ -121,7 +139,9 @@ def ingest_document(file_id: str, filename: str) -> str:
 
     # ---------------------------------------------------------------- chunk
     CHUNK_SIZE = 1_200
-    chunks = [full_text[i : i + CHUNK_SIZE] for i in range(0, len(full_text), CHUNK_SIZE)]
+    chunks = [
+        full_text[i : i + CHUNK_SIZE] for i in range(0, len(full_text), CHUNK_SIZE)
+    ]
 
     # ---------------------------------------------------------------- embed
     vectors = gemini_embed(chunks)
@@ -134,11 +154,10 @@ def ingest_document(file_id: str, filename: str) -> str:
         points.append(
             qdrant.PointStruct(
                 id=f"{file_id}-{idx}",
-                vector=vec,                # ← singular “vector”
+                vector=vec,  # singular “vector”
                 payload=safe_payload(file_id, idx, chunk, filename),
             )
         )
 
-    # Qdrant returns OperationResult; we ignore value
     qdrant_cli.upsert(collection_name=COLLECTION, points=points, wait=True)
     return f"Inserted {len(points)} chunks for file {filename}"
